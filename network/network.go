@@ -140,15 +140,15 @@ type network struct {
 	apricotPhase0Time                  time.Time
 
 	// stateLock should never be held when grabbing a peer lock
-	stateLock           sync.RWMutex
-	pendingBytes        int64
-	closed              utils.AtomicBool
-	disconnectedIPs     map[string]struct{}
-	connectedIPs        map[string]struct{}
-	aliasIPs            map[string]struct{}
-	aliasReleaseFreq    time.Duration
-	aliasReleaseTimeout time.Duration
-	retryDelay          map[string]time.Duration
+	stateLock               sync.RWMutex
+	pendingBytes            int64
+	closed                  utils.AtomicBool
+	disconnectedIPs         map[string]struct{}
+	connectedIPs            map[string]struct{}
+	peerAliasIPs            map[string]struct{}
+	peerAliasReleaseFreq    time.Duration
+	peerAliasReleaseTimeout time.Duration
+	retryDelay              map[string]time.Duration
 	// TODO: bound the size of [myIPs] to avoid DoS. LRU caching would be ideal
 	myIPs map[string]struct{} // set of IPs that resulted in my ID.
 	peers map[ids.ShortID]*peer
@@ -206,8 +206,8 @@ func NewDefaultNetwork(
 	disconnectedRestartTimeout time.Duration,
 	apricotPhase0Time time.Time,
 	sendQueueSize uint32,
-	aliasReleaseFreq time.Duration,
-	aliasReleaseTimeout time.Duration,
+	peerAliasReleaseFreq time.Duration,
+	peerAliasReleaseTimeout time.Duration,
 ) Network {
 	return NewNetwork(
 		registerer,
@@ -249,8 +249,8 @@ func NewDefaultNetwork(
 		disconnectedCheckFreq,
 		disconnectedRestartTimeout,
 		apricotPhase0Time,
-		aliasReleaseFreq,
-		aliasReleaseTimeout,
+		peerAliasReleaseFreq,
+		peerAliasReleaseTimeout,
 	)
 }
 
@@ -295,8 +295,8 @@ func NewNetwork(
 	disconnectedCheckFreq time.Duration,
 	disconnectedRestartTimeout time.Duration,
 	apricotPhase0Time time.Time,
-	aliasReleaseFreq time.Duration,
-	aliasReleaseTimeout time.Duration,
+	peerAliasReleaseFreq time.Duration,
+	peerAliasReleaseTimeout time.Duration,
 ) Network {
 	// #nosec G404
 	netw := &network{
@@ -334,9 +334,9 @@ func NewNetwork(
 		pingFrequency:                      pingFrequency,
 		disconnectedIPs:                    make(map[string]struct{}),
 		connectedIPs:                       make(map[string]struct{}),
-		aliasIPs:                           make(map[string]struct{}),
-		aliasReleaseFreq:                   aliasReleaseFreq,
-		aliasReleaseTimeout:                aliasReleaseTimeout,
+		peerAliasIPs:                       make(map[string]struct{}),
+		peerAliasReleaseFreq:               peerAliasReleaseFreq,
+		peerAliasReleaseTimeout:            peerAliasReleaseTimeout,
 		retryDelay:                         make(map[string]time.Duration),
 		myIPs:                              map[string]struct{}{ip.IP().String(): {}},
 		peers:                              make(map[ids.ShortID]*peer),
@@ -877,7 +877,7 @@ func (n *network) track(ip utils.IPDesc) {
 	if _, ok := n.connectedIPs[str]; ok {
 		return
 	}
-	if _, ok := n.aliasIPs[str]; ok {
+	if _, ok := n.peerAliasIPs[str]; ok {
 		return
 	}
 	if _, ok := n.myIPs[str]; ok {
@@ -1131,18 +1131,18 @@ func (n *network) tryAddPeer(p *peer) error {
 
 	// If I am already connected to this peer, then I should close this new
 	// connection.
-	if linkedPeer, ok := n.peers[p.id]; ok {
+	if existing, ok := n.peers[p.id]; ok {
 		if !ip.IsZero() {
 			str := ip.String()
 			delete(n.disconnectedIPs, str)
 			delete(n.retryDelay, str)
-			n.aliasIPs[str] = struct{}{}
-			linkedPeer.ipLock.Lock()
-			linkedPeer.ipAliases = append(linkedPeer.ipAliases, ipAlias{
+			n.peerAliasIPs[str] = struct{}{}
+			existing.ipLock.Lock()
+			existing.aliases = append(existing.aliases, alias{
 				ip:    ip,
 				added: n.clock.Time().Unix(),
 			})
-			linkedPeer.ipLock.Unlock()
+			existing.ipLock.Unlock()
 		}
 		return fmt.Errorf("duplicated connection from %s at %s", p.id.PrefixedString(constants.NodeIDPrefix), ip)
 	}
@@ -1229,13 +1229,7 @@ func (n *network) disconnected(p *peer) {
 	delete(n.peers, p.id)
 	n.numPeers.Set(float64(len(n.peers)))
 
-	p.ipLock.Lock()                     // TODO: need lock?
-	for _, alias := range p.ipAliases { // ip must be non-zero to be added
-		str := alias.ip.String()
-		delete(n.aliasIPs, str)
-	}
-	p.ipAliases = p.ipAliases[:0]
-	p.ipLock.Unlock()
+	p.removeAliases()
 
 	if !ip.IsZero() {
 		str := ip.String()
